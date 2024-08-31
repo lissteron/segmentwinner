@@ -77,12 +77,14 @@ func main() {
 // Helper function to generate users
 func generateUsers(n int) []segmentwinner.User {
 	users := make([]segmentwinner.User, n)
+    
 	for i := 0; i < n; i++ {
 		users[i] = segmentwinner.User{
 			ID:     i + 1,
 			Points: rand.Intn(3000) + 10,
 		}
 	}
+
 	return users
 }
 ```
