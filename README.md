@@ -41,6 +41,52 @@ The benchmark tests were conducted on a Linux system with an AMD Ryzen 3 3300X 4
 
 The benchmark shows that the algorithm can efficiently handle a dataset of 60 million users, with a total execution time of approximately 1.34 seconds.
 
+### Analysis
+
+- **Execution Time:** 1.34 seconds
+- **Memory Usage:** 3.6 GB
+- **Number of Allocations:** 48,060
+
+## Example Usage
+Here’s a basic example of how to use the Picker struct to select winners:
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/lissteron/segmentwinner"
+)
+
+func main() {
+	// Generate a list of users
+	users := generateUsers(60000000)
+
+	// Create a new Picker instance
+	picker := segmentwinner.NewPicker(8) // 8 workers
+
+	// Define the number of winners to pick
+	numWinners := int(float64(len(users)) * 0.9)
+
+	// Pick the winners
+	winners := picker.Do(users, numWinners)
+
+	fmt.Printf("Number of winners: %d\n", len(winners))
+}
+
+// Helper function to generate users
+func generateUsers(n int) []segmentwinner.User {
+	users := make([]segmentwinner.User, n)
+	for i := 0; i < n; i++ {
+		users[i] = segmentwinner.User{
+			ID:     i + 1,
+			Points: rand.Intn(3000) + 10,
+		}
+	}
+	return users
+}
+```
+
 ## Conclusion
 
 Use this algorithm for tasks requiring high-performance, optimized selection of winners from large participant pools!
