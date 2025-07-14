@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"runtime"
 	"sync"
-	"sync/atomic"
+	"time"
 )
 
 // User represents a user with an ID and points
@@ -29,29 +29,38 @@ func NewPicker(numWorkers int) *Picker {
 // Do splits users into groups and selects winners in parallel
 func (p *Picker) Do(users []User, numWinners int) []User {
 	var (
-		groupSize    = len(users) / p.numWorkers
-		totalPoints  int32
+		N            = len(users)
+		groupSize    = N / p.numWorkers
 		winners      = make([]User, 0, numWinners)
 		groupWinners = make([][]User, p.numWorkers)
+		groupOffset  = 0
+		remainder    = numWinners % p.numWorkers
 	)
 
 	// Launch goroutines for each group
 	for i := 0; i < p.numWorkers; i++ {
 		var (
-			start = i * groupSize
-			end   = start + groupSize
+			start           = groupOffset
+			end             = start + groupSize
+			groupNumWinners = numWinners / p.numWorkers
 		)
 
-		if i == p.numWorkers-1 {
-			end = len(users) // The last group may be larger due to division rounding
+		if i < remainder {
+			groupNumWinners++
 		}
 
+		if i == p.numWorkers-1 {
+			end = N // The last group may be larger due to division rounding
+		}
+
+		groupOffset = end
+
 		group := users[start:end]
-		groupWinners[i] = make([]User, 0, numWinners/p.numWorkers)
+		groupWinners[i] = make([]User, 0, groupNumWinners)
 
 		p.wg.Add(1)
 
-		go p.pickWinnersFromGroup(group, numWinners/p.numWorkers, &groupWinners[i], &totalPoints)
+		go p.pickWinnersFromGroup(group, groupNumWinners, &groupWinners[i])
 	}
 
 	// Wait for all goroutines to complete
@@ -62,43 +71,42 @@ func (p *Picker) Do(users []User, numWinners int) []User {
 		winners = append(winners, gw...)
 	}
 
-	// Ensure the number of winners matches the expected count (numWinners)
-	// If necessary, select additional winners from the combined array
-	if len(winners) < numWinners {
-		var (
-			additionalWinnersNeeded = numWinners - len(winners)
-			extraWinners            = p.Do(winners, additionalWinnersNeeded)
-		)
-
-		winners = append(winners, extraWinners...)
-	}
-
 	return winners
 }
 
 // pickWinnersFromGroup selects winners from a single group of users using a segment tree
-func (p *Picker) pickWinnersFromGroup(users []User, numWinners int, groupWinners *[]User, totalPoints *int32) {
+func (p *Picker) pickWinnersFromGroup(users []User, numWinners int, groupWinners *[]User) {
 	defer p.wg.Done()
+
+	// Use local random source for faster random number generation without global lock
+	localRand := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	// Determine the number of subgroups based on the number of users
 	var (
-		numSubGroups    = max(1, len(users)/5000) // The more users, the more subgroups; minimum 1 subgroup
-		subGroupSize    = len(users) / numSubGroups
-		subGroupResults = make([][]User, numSubGroups)
+		subGroupTargetSize = 1000                                  // Adjusted for potentially better performance (smaller log N)
+		numSubGroups       = max(1, len(users)/subGroupTargetSize) // The more users, the more subgroups; minimum 1 subgroup
+		subGroupSize       = len(users) / numSubGroups
+		subGroupResults    = make([][]User, numSubGroups)
+		subRemainder       = numWinners % numSubGroups
 	)
 
 	for i := 0; i < numSubGroups; i++ {
 		var (
-			start = i * subGroupSize
-			end   = start + subGroupSize
+			start         = i * subGroupSize
+			end           = start + subGroupSize
+			subNumWinners = numWinners / numSubGroups
 		)
+
+		if i < subRemainder {
+			subNumWinners++
+		}
 
 		if i == numSubGroups-1 {
 			end = len(users) // The last subgroup may be larger due to division rounding
 		}
 
 		subGroup := users[start:end]
-		subGroupResults[i] = make([]User, 0, numWinners/numSubGroups)
+		subGroupResults[i] = make([]User, 0, subNumWinners)
 
 		// Process without goroutines to save overhead
 		var (
@@ -106,23 +114,19 @@ func (p *Picker) pickWinnersFromGroup(users []User, numWinners int, groupWinners
 			localPoints = localSt.Sum(0, len(subGroup))
 		)
 
-		for len(subGroupResults[i]) < numWinners/numSubGroups && localPoints > 0 {
+		for len(subGroupResults[i]) < subNumWinners && localPoints > 0 {
 			var (
-				randPoint = rand.Intn(localPoints) + 1
+				randPoint = localRand.Intn(localPoints) + 1
 				index     = localSt.FindIndex(randPoint)
 			)
 
-			if localSt.IsDeleted(index) || subGroup[index].Points == 0 {
-				continue
-			}
+			// Removed redundant check for IsDeleted or Points==0, as tree updates should prevent selection of deleted users
 
 			subGroupResults[i] = append(subGroupResults[i], subGroup[index])
 			localPoints -= subGroup[index].Points
 
 			localSt.MarkAsDeleted(index)
 		}
-
-		atomic.AddInt32(totalPoints, int32(localPoints))
 	}
 
 	// Collect results from all subgroups
