@@ -1,7 +1,5 @@
 package segmentwinner
 
-import "sync/atomic"
-
 // SegmentTree represents the data structure of a segment tree
 type SegmentTree struct {
 	tree       []int
@@ -55,7 +53,7 @@ func (st *SegmentTree) MarkAsDeleted(index int) {
 		bit  = index % st.bitMapSize
 	)
 
-	atomic.StoreUint64(&st.bitmask[word], st.bitmask[word]|(1<<bit))
+	st.bitmask[word] |= (1 << bit) // Removed atomic, as single-threaded access per tree
 
 	st.Update(index, 0) // Immediately update the tree
 }
