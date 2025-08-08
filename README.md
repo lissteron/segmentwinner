@@ -29,23 +29,21 @@ This algorithm is optimal for scenarios where winners need to be selected random
 
 The benchmark tests were conducted on a Linux system with an AMD Ryzen 3 3300X 4-Core Processor. The results demonstrate the algorithm's efficiency in handling large datasets:
 
->goos: linux  
->goarch: amd64  
->pkg: github.com/lissteron/segmentwinner  
->cpu: AMD Ryzen 3 3300X 4-Core Processor               
->BenchmarkPick60kk8p-8   	       1	1342137178 ns/op	3604592400 B/op	   48060 allocs/op  
->--- BENCH: BenchmarkPick60kk8p-8  
->    picker_test.go:27: Execution time: 1.342102452s  
->PASS  
->ok  	github.com/lissteron/segmentwinner	2.856s  
+>goos: linux
+>goarch: amd64
+>pkg: github.com/lissteron/segmentwinner
+>cpu: AMD Ryzen 3 3300X 4-Core Processor             
+>BenchmarkPick60kk8p-8   	       2	 698509477 ns/op	973519752 B/op	      45 allocs/op
+>PASS
+>ok  	github.com/lissteron/segmentwinner	2.904s
 
 The benchmark shows that the algorithm can efficiently handle a dataset of 60 million users, with a total execution time of approximately 1.34 seconds.
 
 ### Analysis
 
-- **Execution Time:** 1.34 seconds
-- **Memory Usage:** 3.6 GB
-- **Number of Allocations:** 48,060
+- **Execution Time:** 0.7 seconds
+- **Memory Usage:** 0.97 GB
+- **Number of Allocations:** 45
 
 ## Example Usage
 Here’s a basic example of how to use the Picker struct to select winners:
