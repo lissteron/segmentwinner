@@ -3,29 +3,34 @@ package segmentwinner_test
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"slices"
 	"testing"
-	"time"
 
 	"github.com/lissteron/segmentwinner"
 )
 
+var sink []segmentwinner.User // пакетная переменная
+
 func BenchmarkPick60kk8p(b *testing.B) {
-	var (
-		users  = generateUsers(60_000_000)
-		picker = segmentwinner.NewPicker(0)
-	)
+	N := 60_000_000
+	K := int(float64(N) * 0.90)
 
+	users := make([]segmentwinner.User, N)
+	for i := range users {
+		users[i] = segmentwinner.User{ID: i, Points: 1} // или твоя реальная генерация весов
+	}
+
+	p := segmentwinner.NewPicker(runtime.NumCPU())
+
+	b.ReportAllocs()
 	b.ResetTimer()
-
-	start := time.Now() // Start timing
-
-	picker.Do(users, int(float64(len(users))*0.9))
-
-	duration := time.Since(start) // Measure execution time
-
-	b.Logf("Execution time: %v", duration)
-	b.StopTimer() // Stop timer
+	for i := 0; i < b.N; i++ {
+		sink = p.Do(users, K)
+		if len(sink) != K {
+			b.Fatalf("got %d winners, want %d", len(sink), K)
+		}
+	}
 }
 
 func TestPickWinners(t *testing.T) {
