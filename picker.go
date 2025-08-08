@@ -9,16 +9,20 @@ import (
 	"time"
 )
 
+// User — ваш тип
 type User struct {
 	ID     int
 	Points int
 }
 
+// Picker — менеджер параллельной выборки
 type Picker struct {
 	numWorkers int
-	seed       int64 // 0 => time.Now().UnixNano()
+	seed       int64 // 0 => time.Now().UnixNano(); в тестах можно выставлять напрямую (один пакет)
 }
 
+// NewPicker initializes a new Picker with a specified number of workers.
+// It sets the number of workers to the maximum number of CPUs available or the specified number.
 func NewPicker(numWorkers int) *Picker {
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
@@ -26,7 +30,43 @@ func NewPicker(numWorkers int) *Picker {
 	return &Picker{numWorkers: numWorkers}
 }
 
-// ===== splitmix64 RNG =====
+// Do splits users into groups and selects winners in parallel.
+// Алгоритм:
+//   - если k > N/2 — выбираем m=N-k "проигравших" (по наибольшим ключам), победители — все остальные;
+//   - если k <= N/2 — быстрый reservoir (O(N log k)) по наименьшим ключам.
+//
+// Ключ = Exp(1)/w, чем МЕНЬШЕ — тем ближе к победителю.
+func (p *Picker) Do(users []User, numWinners int) []User {
+	n := len(users)
+	if n == 0 || numWinners <= 0 {
+		return nil
+	}
+	if numWinners >= n {
+		out := make([]User, n)
+		copy(out, users)
+		return out
+	}
+
+	workers := p.numWorkers
+	if workers > n {
+		workers = n
+	}
+	chunk := (n + workers - 1) / workers
+
+	baseSeed := p.seed
+	if baseSeed == 0 {
+		baseSeed = time.Now().UnixNano()
+	}
+
+	// Большое k — через "проигравших" (m = N - k)
+	if numWinners*2 > n {
+		return p.pickViaLosers(users, numWinners, workers, chunk, baseSeed)
+	}
+	// Малое k — reservoir
+	return p.pickReservoirSmallK(users, numWinners, workers, chunk, baseSeed)
+}
+
+// ===== splitmix64 RNG (очень быстрый, детерминируемый) =====
 
 type sm64 struct{ s uint64 }
 
@@ -50,11 +90,11 @@ func (r *sm64) exp1() float64 { // Exp(1) = -ln(U), U∈(0,1]
 	return -math.Log(u)
 }
 
-// ===== минимальный heap без аллокаций на операцию =====
+// ===== минимальные структуры/хелперы =====
 
 type kv struct {
-	key float32
-	idx uint32
+	key float32 // ключ (меньше — «лучше»/ближе к победе)
+	idx uint32  // индекс пользователя в исходном слайсе
 }
 
 func up[T any](a []T, j int, less func([]T, int, int) bool) {
@@ -91,56 +131,21 @@ func build[T any](a []T, less func([]T, int, int) bool) {
 	}
 }
 
-// ===== основной API =====
-
-func (p *Picker) Do(users []User, numWinners int) []User {
-	n := len(users)
-	if n == 0 || numWinners <= 0 {
-		return nil
-	}
-	if numWinners >= n {
-		// тривиальный случай
-		out := make([]User, 0, n)
-		out = append(out, users...)
-		return out
-	}
-
-	workers := p.numWorkers
-	if workers > n {
-		workers = n
-	}
-	chunk := (n + workers - 1) / workers
-
-	baseSeed := p.seed
-	if baseSeed == 0 {
-		baseSeed = time.Now().UnixNano()
-	}
-
-	// Если k > N/2 — работаем "через проигравших"
-	if numWinners*2 > n {
-		return p.pickViaLosers(users, numWinners, workers, chunk, baseSeed)
-	}
-
-	// (опционально) путь для малого k — можно оставить прежний быстрый reservoir
-	return p.pickReservoirSmallK(users, numWinners, workers, chunk, baseSeed)
-}
-
-// ---- Быстрый путь для большого k: выбираем m=N-k проигравших ----
+// ===== путь для БОЛЬШОГО k: выбираем m=N-k проигравших =====
 
 func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, baseSeed int64) []User {
 	n := len(users)
-	m := n - numWinners // сколько надо "выбросить"
+	m := n - numWinners // число "проигравших" (того, что кладём в кучу)
 
-	// 1) суммарные веса по чанкам, чтобы дать квоты
+	// 1) инфо по чанкам (границы, число позитивных весов)
 	type chunkInfo struct {
 		start, end int
-		sum        uint64
-		posCount   int // число пользователей с Points>0
+		posCount   int
 	}
 	chunks := make([]chunkInfo, workers)
+
 	var wg sync.WaitGroup
 	wg.Add(workers)
-
 	for i := 0; i < workers; i++ {
 		i := i
 		start := i * chunk
@@ -152,89 +157,63 @@ func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, bas
 		if end > n {
 			end = n
 		}
-		chunks[i] = chunkInfo{start: start, end: end}
+		chunks[i].start, chunks[i].end = start, end
 		go func() {
 			defer wg.Done()
-			var s uint64
-			var pc int
+			pc := 0
 			for _, u := range users[start:end] {
 				if u.Points > 0 {
-					s += uint64(u.Points)
 					pc++
 				}
 			}
-			chunks[i].sum = s
 			chunks[i].posCount = pc
 		}()
 	}
 	wg.Wait()
 
-	var totalW uint64
+	totalPos := 0
 	for _, c := range chunks {
-		totalW += c.sum
+		totalPos += c.posCount
 	}
-	if totalW == 0 {
-		// все веса нулевые — произвольные m "проигравших"
-		bitmap := make([]uint64, (n+63)/64)
-		// просто первые m как проигравшие
-		for i := 0; i < m; i++ {
-			word := i >> 6
-			bit := uint(i & 63)
-			bitmap[word] |= 1 << bit
-		}
-		// было: последовательный однопоточный проход
-		// out := make([]User, 0, numWinners)
-		// for i, u := range users {
-		//     if (bitmap[i>>6]>>(uint(i)&63))&1 == 0 {
-		//         out = append(out, u)
-		//     }
-		// }
-
-		// стало:
-		out := collectWinnersParallel(users, bitmap, workers, numWinners)
+	if totalPos == 0 {
+		// все веса нулевые — определённости нет, отдадим первые k как победителей
+		out := make([]User, numWinners)
+		copy(out, users[:numWinners])
 		return out
 	}
 
-	// 2) квоты проигравших по чанкам пропорционально весам, + guard (12.5%)
+	// 2) квоты для локальных куч пропорционально количеству позитивных
 	quota := make([]int, workers)
-	rems := make([]struct {
+	type rem struct {
 		i    int
 		frac float64
-	}, 0, workers)
+	}
+	rems := make([]rem, 0, workers)
 	var assigned int
 	for i, c := range chunks {
-		exact := float64(m) * float64(c.sum) / float64(totalW)
+		exact := float64(m) * float64(c.posCount) / float64(totalPos)
 		base := int(exact)
 		quota[i] = base
 		assigned += base
-		rems = append(rems, struct {
-			i    int
-			frac float64
-		}{i: i, frac: exact - float64(base)})
+		rems = append(rems, rem{i: i, frac: exact - float64(base)})
 	}
 	sort.Slice(rems, func(a, b int) bool { return rems[a].frac > rems[b].frac })
 	for k := 0; k < m-assigned; k++ {
 		quota[rems[k].i]++
 	}
-
-	// guard и верхняя граница
-	const guardDiv = 8 // 12.5% оверсэмпл
+	// без оверсэмплинга ради скорости
 	for i := range quota {
-		q := quota[i]
-		if q == 0 && chunks[i].posCount > 0 {
-			q = 1
+		if quota[i] == 0 && chunks[i].posCount > 0 {
+			quota[i] = 1
 		}
-		q += q / guardDiv
-		if q > chunks[i].posCount {
-			q = chunks[i].posCount
+		if quota[i] > chunks[i].posCount {
+			quota[i] = chunks[i].posCount
 		}
-		quota[i] = q
 	}
 
-	// 3) каждая горутина держит max-heap из quota[i] худших ключей (т.е. локальные "проигравшие"-кандидаты)
+	// 3) локальные min-heap по НАИБОЛЬШИМ ключам (losers)
 	local := make([][]kv, workers)
 	wg.Add(workers)
-
 	for i := 0; i < workers; i++ {
 		i := i
 		c := chunks[i]
@@ -245,16 +224,17 @@ func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, bas
 			}
 			kcap := quota[i]
 			h := make([]kv, 0, kcap)
-			less := func(a []kv, i, j int) bool { return a[i].key > a[j].key } // max-heap
+			// min-heap: корень — минимальный ключ
+			less := func(a []kv, i, j int) bool { return a[i].key < a[j].key }
 
 			r := sm64{s: uint64(baseSeed) ^ uint64(i+1)*0x9e3779b97f4a7c15}
 
-			// заполняем до kcap
+			// заполнение до kcap
 			for idx := c.start; idx < c.end && len(h) < kcap; idx++ {
 				if users[idx].Points <= 0 {
 					continue
 				}
-				key := float32(r.exp1() / float64(users[idx].Points)) // меньше — лучше
+				key := float32(r.exp1() / float64(users[idx].Points))
 				h = append(h, kv{key: key, idx: uint32(idx)})
 			}
 			if len(h) == 0 {
@@ -262,13 +242,14 @@ func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, bas
 			}
 			build(h, less)
 
-			// если заполнено — идём по остальным
+			// поддерживаем kcap НАИБОЛЬШИХ ключей:
+			// если новый ключ > корня (минимума) — заменяем
 			for idx := c.start + len(h); idx < c.end; idx++ {
 				if users[idx].Points <= 0 {
 					continue
 				}
 				key := float32(r.exp1() / float64(users[idx].Points))
-				if key < h[0].key {
+				if key > h[0].key {
 					h[0] = kv{key: key, idx: uint32(idx)}
 					down(h, 0, len(h), less)
 				}
@@ -278,11 +259,11 @@ func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, bas
 	}
 	wg.Wait()
 
-	// 4) глобальный max-heap размера m: берём глобально m наименьших ключей (т.е. проигравших)
-	// (в худшем — m = 6e6; элемент 16 байт => ~96 МБ)
+	// 4) глобальный min-heap размера m: держим m НАИБОЛЬШИХ ключей (итоговые losers)
 	global := make([]kv, 0, m)
-	less := func(a []kv, i, j int) bool { return a[i].key > a[j].key } // max-heap
-	// build из первых чанков, пока не наберём m
+	minLess := func(a []kv, i, j int) bool { return a[i].key < a[j].key } // min-heap
+
+	// инициализация глобальной кучи
 	for i := range local {
 		for _, e := range local[i] {
 			if len(global) < m {
@@ -296,11 +277,11 @@ func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, bas
 		}
 	}
 	if len(global) == 0 {
-		// никто не имел положительных очков
-		return nil
+		out := make([]User, numWinners)
+		copy(out, users[:numWinners])
+		return out
 	}
 	if len(global) < m {
-		// добираем оставшимся
 		for i := range local {
 			if len(global) >= m {
 				break
@@ -317,46 +298,141 @@ func (p *Picker) pickViaLosers(users []User, numWinners, workers, chunk int, bas
 			}
 		}
 	}
-	build(global, less)
-	// теперь регулярно пытаемся улучшить global худший
+	build(global, minLess)
+
+	// держим m наибольших ключей
 	for i := range local {
 		for _, e := range local[i] {
-			if e.key < global[0].key {
+			if e.key > global[0].key {
 				global[0] = e
-				down(global, 0, len(global), less)
+				down(global, 0, len(global), minLess)
 			}
 		}
 	}
 
-	// 5) помечаем проигравших битсет-маской и собираем победителей без доп. аллокаций
+	// 5) битсет проигравших и параллельная сборка победителей
 	bitmap := make([]uint64, (n+63)/64)
 	for _, e := range global {
 		ii := int(e.idx)
 		bitmap[ii>>6] |= 1 << (uint(ii) & 63)
 	}
+	return collectWinnersParallel(users, bitmap, workers, numWinners)
+}
 
-	out := make([]User, 0, numWinners)
-	for i, u := range users {
-		if (bitmap[i>>6]>>(uint(i)&63))&1 == 0 {
-			out = append(out, u)
-		}
+// Параллельная сборка победителей из битсета "проигравших".
+func collectWinnersParallel(users []User, bitmap []uint64, workers, numWinners int) []User {
+	n := len(users)
+	if workers > n {
+		workers = n
 	}
+	chunk := (n + workers - 1) / workers
+
+	// PASS 1: считаем победителей по чанкам
+	counts := make([]int, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		w := w
+		start := w * chunk
+		end := start + chunk
+		if start >= n {
+			wg.Done()
+			continue
+		}
+		if end > n {
+			end = n
+		}
+		go func() {
+			defer wg.Done()
+			losers := 0
+			wordStart := start >> 6
+			wordEnd := (end + 63) >> 6
+			for wi := wordStart; wi < wordEnd; wi++ {
+				word := bitmap[wi]
+				if word == 0 {
+					continue
+				}
+				if wi == wordStart {
+					left := start & 63
+					word &= ^uint64(0) << left
+				}
+				if wi == wordEnd-1 {
+					right := (end - 1) & 63
+					word &= ^uint64(0) >> (63 - right)
+				}
+				losers += bits.OnesCount64(word)
+			}
+			counts[w] = (end - start) - losers
+		}()
+	}
+	wg.Wait()
+
+	// префикс-суммы → оффсеты записи
+	offsets := make([]int, workers+1)
+	for i := 0; i < workers; i++ {
+		offsets[i+1] = offsets[i] + counts[i]
+	}
+	out := make([]User, numWinners)
+
+	// PASS 2: параллельная запись победителей
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		w := w
+		start := w * chunk
+		end := start + chunk
+		if start >= n {
+			wg.Done()
+			continue
+		}
+		if end > n {
+			end = n
+		}
+		dst := offsets[w]
+		go func() {
+			defer wg.Done()
+			i := start
+			for i < end {
+				wi := i >> 6
+				word := bitmap[wi]
+				limit := (wi + 1) << 6
+				if limit > end {
+					limit = end
+				}
+				// быстрый путь: нет проигравших в этом слове — копируем блоком
+				if word == 0 {
+					for ; i < limit; i++ {
+						out[dst] = users[i]
+						dst++
+					}
+					continue
+				}
+				// иначе проверяем по битам
+				for ; i < limit; i++ {
+					if (bitmap[i>>6]>>(uint(i)&63))&1 == 0 {
+						out[dst] = users[i]
+						dst++
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
 	return out
 }
 
-// ---- путь для малого k (можно оставить простым и быстрым) ----
+// ===== путь для МАЛОГО k: быстрый reservoir (O(N log k)) =====
 
 func (p *Picker) pickReservoirSmallK(users []User, k, workers, chunk int, baseSeed int64) []User {
 	n := len(users)
-	type heapS struct{ a []kv }
-	less := func(a []kv, i, j int) bool { return a[i].key > a[j].key } // max-heap
 
-	// локальные квоты примерно пропорционально числу позитивных в чанке + guard
+	// инфо по чанкам: границы и СУММА ВЕСОВ (исправление квот!)
 	type chunkInfo struct {
 		start, end int
+		sumW       uint64
 		pos        int
 	}
 	ch := make([]chunkInfo, workers)
+
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
@@ -373,56 +449,56 @@ func (p *Picker) pickReservoirSmallK(users []User, k, workers, chunk int, baseSe
 		ch[i] = chunkInfo{start: start, end: end}
 		go func() {
 			defer wg.Done()
+			var s uint64
 			pos := 0
 			for _, u := range users[start:end] {
 				if u.Points > 0 {
+					s += uint64(u.Points)
 					pos++
 				}
 			}
+			ch[i].sumW = s
 			ch[i].pos = pos
 		}()
 	}
 	wg.Wait()
 
-	// квоты по числу позитивных
-	totalPos := 0
+	var totalW uint64
 	for _, c := range ch {
-		totalPos += c.pos
+		totalW += c.sumW
 	}
-	if totalPos == 0 {
+	if totalW == 0 {
 		return nil
 	}
+
+	// Квоты ∝ сумме весов (исправление)
 	quota := make([]int, workers)
-	var assigned int
-	rems := make([]struct {
+	type rem struct {
 		i    int
 		frac float64
-	}, 0, workers)
+	}
+	rems := make([]rem, 0, workers)
+	var assigned int
 	for i, c := range ch {
-		ex := float64(k) * float64(c.pos) / float64(totalPos)
+		ex := float64(k) * float64(c.sumW) / float64(totalW)
 		base := int(ex)
 		quota[i] = base
 		assigned += base
-		rems = append(rems, struct {
-			i    int
-			frac float64
-		}{i: i, frac: ex - float64(base)})
+		rems = append(rems, rem{i: i, frac: ex - float64(base)})
 	}
 	sort.Slice(rems, func(a, b int) bool { return rems[a].frac > rems[b].frac })
 	for t := 0; t < k-assigned; t++ {
 		quota[rems[t].i]++
 	}
-	// лёгкий guard
 	for i := range quota {
-		quota[i] += quota[i] / 8
-		if quota[i] > ch[i].pos {
+		if quota[i] > ch[i].pos { // не больше числа позитивных
 			quota[i] = ch[i].pos
 		}
 	}
 
-	locals := make([][]kv, workers)
+	// локальные max-heap: держим kcap ЛУЧШИХ (наименьшие ключи), корень — худший среди лучших
+	local := make([][]kv, workers)
 	wg.Add(workers)
-
 	for i := 0; i < workers; i++ {
 		i := i
 		start, end := ch[i].start, ch[i].end
@@ -433,9 +509,11 @@ func (p *Picker) pickReservoirSmallK(users []User, k, workers, chunk int, baseSe
 				return
 			}
 			h := make([]kv, 0, capK)
+			// max-heap: корень — максимальный ключ
+			less := func(a []kv, i, j int) bool { return a[i].key > a[j].key }
+
 			r := sm64{s: uint64(baseSeed) ^ uint64(i+1)*0x9e3779b97f4a7c15}
 
-			// заполнение
 			for idx := start; idx < end && len(h) < capK; idx++ {
 				if users[idx].Points <= 0 {
 					continue
@@ -457,140 +535,65 @@ func (p *Picker) pickReservoirSmallK(users []User, k, workers, chunk int, baseSe
 					down(h, 0, len(h), less)
 				}
 			}
-			locals[i] = h
+			local[i] = h
 		}()
 	}
 	wg.Wait()
 
 	// глобальный max-heap размера k
 	global := make([]kv, 0, k)
-	for i := range locals {
-		for _, e := range locals[i] {
+	maxLess := func(a []kv, i, j int) bool { return a[i].key > a[j].key } // max-heap
+
+	// начальная загрузка
+	for i := range local {
+		for _, e := range local[i] {
 			if len(global) < k {
 				global = append(global, e)
-			} else if e.key < global[0].key {
-				global[0] = e
-				down(global, 0, len(global), less)
-			}
-			if len(global) == k && i == 0 && len(global) == cap(global) {
-				// build один раз, если не сделали
-				build(global, less)
+			} else {
+				break
 			}
 		}
+		if len(global) >= k {
+			break
+		}
+	}
+	if len(global) == 0 {
+		return nil
 	}
 	if len(global) < k {
-		build(global, less)
+		for i := range local {
+			if len(global) >= k {
+				break
+			}
+			if i == 0 {
+				continue
+			}
+			for _, e := range local[i] {
+				if len(global) < k {
+					global = append(global, e)
+				} else {
+					break
+				}
+			}
+		}
 	}
-	// выгрузка в возрастающем порядке ключа
+	build(global, maxLess)
+
+	for i := range local {
+		for _, e := range local[i] {
+			if e.key < global[0].key {
+				global[0] = e
+				down(global, 0, len(global), maxLess)
+			}
+		}
+	}
+
+	// выгружаем в порядке возрастания ключа (не обязательно, но удобно)
 	sort.Slice(global, func(i, j int) bool { return global[i].key < global[j].key })
 
-	out := make([]User, 0, len(global))
-	for _, e := range global {
-		out = append(out, users[int(e.idx)])
+	out := make([]User, len(global))
+	for i := range global {
+		out[i] = users[int(global[i].idx)]
 	}
-	return out
-}
-
-func collectWinnersParallel(users []User, bitmap []uint64, workers, numWinners int) []User {
-	n := len(users)
-	if workers > n {
-		workers = n
-	}
-	chunk := (n + workers - 1) / workers
-
-	// --- PASS 1: считаем победителей по чанкам ---
-	counts := make([]int, workers)
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	for w := 0; w < workers; w++ {
-		w := w
-		start := w * chunk
-		end := start + chunk
-		if start >= n {
-			wg.Done()
-			continue
-		}
-		if end > n {
-			end = n
-		}
-		go func() {
-			defer wg.Done()
-			losers := 0
-			// считаем проигравших словом, чтобы меньше условных переходов
-			wordStart := start >> 6
-			wordEnd := (end + 63) >> 6
-			for wi := wordStart; wi < wordEnd; wi++ {
-				word := bitmap[wi]
-				// маска для краёв чанка
-				left := 0
-				right := 63
-				if wi == wordStart {
-					left = start & 63
-					word &= ^uint64(0) << left
-				}
-				if wi == wordEnd-1 {
-					right = (end - 1) & 63
-					word &= ^uint64(0) >> (63 - right)
-				}
-				losers += bits.OnesCount64(word)
-			}
-			counts[w] = (end - start) - losers
-		}()
-	}
-	wg.Wait()
-
-	// префикс-сумма → оффсеты записи
-	offsets := make([]int, workers+1)
-	for i := 0; i < workers; i++ {
-		offsets[i+1] = offsets[i] + counts[i]
-	}
-	out := make([]User, numWinners)
-
-	// --- PASS 2: параллельная запись победителей ---
-	wg.Add(workers)
-	for w := 0; w < workers; w++ {
-		w := w
-		start := w * chunk
-		end := start + chunk
-		if start >= n {
-			wg.Done()
-			continue
-		}
-		if end > n {
-			end = n
-		}
-		dst := offsets[w]
-		go func() {
-			defer wg.Done()
-			// идём блоками по 64, чтобы меньше ветвлений
-			i := start
-			for i < end {
-				wi := i >> 6
-				word := bitmap[wi]
-				limit := (wi + 1) << 6
-				if limit > end {
-					limit = end
-				}
-				// быстрый путь: если слово пустое (нет проигравших), копируем блоком
-				if word == 0 && (limit-i) == 64 || (word == 0 && limit-i < 64) {
-					// копируем подряд всех 0-битов (т.е. всех победителей в слове)
-					// NB: для «частичного» последнего слова тоже сработает
-					for ; i < limit; i++ {
-						out[dst] = users[i]
-						dst++
-					}
-					continue
-				}
-				// иначе проверяем по битам
-				for ; i < limit; i++ {
-					if (bitmap[i>>6]>>(uint(i)&63))&1 == 0 {
-						out[dst] = users[i]
-						dst++
-					}
-				}
-			}
-		}()
-	}
-	wg.Wait()
 	return out
 }
